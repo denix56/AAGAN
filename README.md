@@ -3,7 +3,7 @@ Unofficial PyTorch implementation of Enhanced Single Image Dehazing with Attenti
 
 This is an unofficial umplementation of the https://ieeexplore.ieee.org/stamp/stamp.jsp?arnumber=8918328
 
-# My changes:
+## My changes:
 
 1) In the paper the residual layers have 512 in_channels and out_channels (according to the picture from paper). However, the last enBlock returns 1024 channels. I make residual blocks with 1024 channels.
 
@@ -15,10 +15,10 @@ This is an unofficial umplementation of the https://ieeexplore.ieee.org/stamp/st
 
 5) I did not perform denosing mentioned in the paper, because I did not find any easy to use implementation of gradient guided image filter. I have used raw dataset with random crop and random horizontal flip.
 
-# Dataset
+## Dataset
 The project by default uses NYUv2 labeled dataset. Just download dataset .mat file and splits.mat for train/test split and specify the patthes to them when runnig script.
 
-# Requirements
+## Requirements
 PyTorch 1.3.1
 Torchvision
 tqdm
