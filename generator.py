@@ -77,7 +77,7 @@ class ResBlock(Module):
 
         self.layer =  Sequential(
             Conv2d(in_channels, in_channels, kernel_size=3, stride=1),
-            ReLU(),
+            ReLU(inplace=True),
             Conv2d(in_channels, in_channels, kernel_size=3, stride=1)
         )
 
@@ -107,7 +107,7 @@ class ENBlock(Module):
 
             return out, dcam_out
         else:
-            return self.conv2(relu(out))
+            return self.conv2(relu(out, inplace=True))
 
 
 class DEBlock(Module):

@@ -1,3 +1,8 @@
+from multiprocessing import cpu_count
+import time
+import os
+import argparse
+
 import torch
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -6,29 +11,12 @@ from torch.optim.lr_scheduler import StepLR
 from torch.nn import MSELoss, L1Loss
 import torchvision.models as models
 from torchvision.utils import make_grid
+from torchvision.transforms import Normalize
 
 from generator import Generator
 from discriminator import Discriminator
 from loss import *
 from NYUv2Dataset import NYUv2Dataset
-from multiprocessing import cpu_count
-import time
-
-import os
-
-import argparse
-
-
-def haze_images(imgs, depths, beta_min=0.6, beta_max=1.8, eta_min=0.5, eta_max=1):
-    batch_size = depths.size(0)
-
-    beta = torch.rand(batch_size, 1, 1, 1, device=imgs.device) * (beta_max - beta_min) + beta_min
-    t = torch.exp(-beta * depths)
-
-    eta = torch.rand(batch_size, 1, 1, 1, device=imgs.device) * (eta_max - eta_min) + eta_min
-    A = eta.expand(batch_size, 3, t.size(2), t.size(3))
-    I = imgs * t + A * (1 - t)
-    return I
 
 
 def save_checkpoint(args, generator, discriminator, g_optimizer, d_optimizer, g_step_lr, d_step_lr, step):
@@ -85,8 +73,8 @@ def train(args):
     vgg19 = models.vgg19(pretrained=True, progress=True).features
     vgg19.to(device)
 
-    g_optimizer = Adam(generator.parameters(), lr=args.learning_rate)
-    d_optimizer = Adam(discriminator.parameters(), lr=args.learning_rate)
+    g_optimizer = Adam(generator.parameters(), lr=args.generator_learning_rate)
+    d_optimizer = Adam(discriminator.parameters(), lr=args.discriminator_learning_rate)
 
     content_loss = L1Loss()
     perceptual_loss = MSELoss()
@@ -110,6 +98,9 @@ def train(args):
 
     del img, depth
 
+    inv_normalize = Normalize(mean=[-0.485/0.229, -0.456/0.224, -0.406/0.225],
+                              std=[1/0.229, 1/0.224, 1/0.225], inplace=True)
+
     feat_maps = {}
 
     def get_hook(name):
@@ -120,36 +111,39 @@ def train(args):
 
     for epoch in range(args.epochs):
         print('Epoch {}'.format(epoch))
-        for samples, depths in loader:
+
+        for samples, hazy_samples in loader:
             start = time.time()
 
             samples = samples.to(device)
-            depths = depths.to(device)
+            hazy_samples = hazy_samples.to(device)
 
-            hazy_samples = haze_images(samples, depths)
+            g_outputs = generator(hazy_samples)
 
             global_step += 1
 
-            g_optimizer.zero_grad()
+            out_str = 'Step {}'.format(global_step)
 
-            g_outputs = generator(hazy_samples)
-            g_loss_c = content_loss(samples, g_outputs)
-            g_loss_p = perceptual_loss(vgg19(samples), vgg19(g_outputs))
+            if global_step >= args.gen_train_start_step:
+                g_optimizer.zero_grad()
 
-            C_ij = discriminator(hazy_samples, g_outputs)
-            C_ik = discriminator(hazy_samples, samples)
+                g_loss_c = content_loss(samples, g_outputs)
+                g_loss_p = perceptual_loss(vgg19(samples), vgg19(g_outputs))
 
-            g_loss_r = ralsgan_loss(C_ij, C_ik)
+                C_ij = discriminator(hazy_samples, g_outputs)
+                C_ik = discriminator(hazy_samples, samples)
 
-            g_loss = args.lambda_c * g_loss_c + args.lambda_p * g_loss_p + args.lambda_r * g_loss_r
-            g_loss.backward()
-            g_optimizer.step()
-            g_step_lr.step()
+                g_loss_r = ralsgan_loss(C_ij, C_ik)
 
-            out_str = 'Step {}, g_loss {:.4f}, content_loss {:.4f}, perceptual_loss {:.4f}, ralsgan_loss {:.4f}'.format(
-                global_step, g_loss.item(), g_loss_c.item(), g_loss_p.item(), g_loss_r.item())
+                g_loss = args.lambda_c * g_loss_c + args.lambda_p * g_loss_p + args.lambda_r * g_loss_r
+                g_loss.backward()
+                g_optimizer.step()
+                g_step_lr.step()
 
-            if global_step > args.discr_train_start_step:
+                out_str += ', g_loss {:.4f}, content_loss {:.4f}, perceptual_loss {:.4f}, ralsgan_loss {:.4f}'.format(
+                    g_loss.item(), g_loss_c.item(), g_loss_p.item(), g_loss_r.item())
+
+            if global_step >= args.discr_train_start_step:
                 d_optimizer.zero_grad()
 
                 C_ij = discriminator(hazy_samples, samples)
@@ -170,9 +164,11 @@ def train(args):
 
             if global_step % args.summary_step == 0:
                 with torch.no_grad():
-                    img, depth = next(iter(test_loader))
+                    img, hazed_img, depth = next(iter(test_loader))
                     img = img.to(device)
+                    hazed_img = hazed_img.to(device)
                     depth = depth.to(device)
+
                     writer.add_scalar('generator/generator_loss', g_loss, global_step)
                     writer.add_scalar('generator/content_loss', g_loss_c, global_step)
                     writer.add_scalar('generator/perceptual_loss', g_loss_p, global_step)
@@ -186,12 +182,21 @@ def train(args):
                     for name, layer in zip(map_names, layers):
                         layer.register_forward_hook(get_hook(name))
 
-                    hazed_img = haze_images(img, depth)
                     test_g_out = generator(hazed_img)
 
-                    writer.add_image('GT', img.squeeze(0), global_step)
-                    writer.add_image('Hazed', hazed_img.squeeze(0), global_step)
-                    writer.add_image('Dehazed', test_g_out.squeeze(0), global_step)
+                    img.squeeze_(0)
+                    hazed_img.squeeze_(0)
+                    depth.squeeze_(0)
+                    test_g_out.squeeze_(0)
+
+                    inv_normalize(img)
+                    inv_normalize(hazed_img)
+                    inv_normalize(test_g_out)
+
+                    writer.add_image('GT', img, global_step)
+                    writer.add_image('Depth_map', depth, global_step)
+                    writer.add_image('Hazed', hazed_img, global_step)
+                    writer.add_image('Dehazed', test_g_out, global_step)
 
                     for name, feat_map in feat_maps.items():
                         writer.add_image(name, make_grid(feat_map, normalize=True, scale_each=True), global_step)
@@ -217,8 +222,10 @@ if __name__ == '__main__':
     parser.add_argument('--epochs', type=int, default=100, help='Number of epochs')
     parser.add_argument('--logdir', type=str, default='logdir', help='Directory to save checkpoints and '
                                                                      'tensorboard output')
+    parser.add_argument('--gen_train_start_step', type=int, default=0, help='Step to start training generator')
     parser.add_argument('--discr_train_start_step', type=int, default=0, help='Step to start training discriminator')
-    parser.add_argument('-lr', '--learning_rate', type=float, default=2e-4, help='Learning rate')
+    parser.add_argument('-glr', '--generator_learning_rate', type=float, default=2e-4, help='Learning rate')
+    parser.add_argument('-dlr', '--discriminator_learning_rate', type=float, default=2e-4, help='Learning rate')
     parser.add_argument('--checkpoint_step', type=int, default=5000, help='Checkpoint save interval')
     parser.add_argument('--summary_step', type=int, default=100, help='Save info to Tensorboard')
     parser.add_argument('--resume', type=str, help='Resume training from checkpoint')
