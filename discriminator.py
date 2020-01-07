@@ -1,5 +1,5 @@
 import torch
-from torch.nn import LeakyReLU, Module, Sequential
+from torch.nn import LeakyReLU, Module, Sequential, Dropout
 from modules import Conv2d
 
 

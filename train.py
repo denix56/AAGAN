@@ -2,6 +2,7 @@ from multiprocessing import cpu_count
 import time
 import os
 import argparse
+import random
 
 import torch
 from torch.utils.data import DataLoader
@@ -61,7 +62,7 @@ def train(args):
     test_loader = DataLoader(test_dataset, batch_size=1, num_workers=0,
                         shuffle=True, pin_memory=True)
 
-    generator = Generator(3, args.use_log_softmax)
+    generator = Generator(3, args.use_log_softmax, args.interpolation_mode)
     discriminator = Discriminator(3)
 
     print(generator)
@@ -73,7 +74,7 @@ def train(args):
     vgg19 = models.vgg19(pretrained=True, progress=True).features
     vgg19.to(device)
 
-    g_optimizer = Adam(generator.parameters(), lr=args.generator_learning_rate)
+    g_optimizer = Adam(generator.parameters(), lr=args.generator_learning_rate,)
     d_optimizer = Adam(discriminator.parameters(), lr=args.discriminator_learning_rate)
 
     content_loss = L1Loss()
@@ -98,8 +99,10 @@ def train(args):
 
     del img, depth
 
-    inv_normalize = Normalize(mean=[-0.485/0.229, -0.456/0.224, -0.406/0.225],
-                              std=[1/0.229, 1/0.224, 1/0.225], inplace=True)
+    vgg_normalize = Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    inv_normalize = lambda x: torch.clamp((x + 1) * 0.5, 0, 1)
+
+    vgg_preprocess = lambda x: torch.stack([vgg_normalize(m) for m in torch.unbind(inv_normalize(x), dim=0)], dim=0)
 
     feat_maps = {}
 
@@ -108,6 +111,9 @@ def train(args):
             feat_maps[name] = output.detach().view(-1, 1, output.size(2), output.size(3))
 
         return hook
+
+    interpolation_layer = generator.interpolation_layer()
+    interpolation_layer.tau.requires_grad = False
 
     for epoch in range(args.epochs):
         print('Epoch {}'.format(epoch))
@@ -118,35 +124,21 @@ def train(args):
             samples = samples.to(device)
             hazy_samples = hazy_samples.to(device)
 
+            if global_step >= args.tau_start_step:
+                interpolation_layer.tau.requires_grad = True
+
             g_outputs = generator(hazy_samples)
 
             global_step += 1
 
             out_str = 'Step {}'.format(global_step)
 
-            if global_step >= args.gen_train_start_step:
-                g_optimizer.zero_grad()
-
-                g_loss_c = content_loss(samples, g_outputs)
-                g_loss_p = perceptual_loss(vgg19(samples), vgg19(g_outputs))
-
-                C_ij = discriminator(hazy_samples, g_outputs)
-                C_ik = discriminator(hazy_samples, samples)
-
-                g_loss_r = ralsgan_loss(C_ij, C_ik)
-
-                g_loss = args.lambda_c * g_loss_c + args.lambda_p * g_loss_p + args.lambda_r * g_loss_r
-                g_loss.backward()
-                g_optimizer.step()
-                g_step_lr.step()
-
-                out_str += ', g_loss {:.4f}, content_loss {:.4f}, perceptual_loss {:.4f}, ralsgan_loss {:.4f}'.format(
-                    g_loss.item(), g_loss_c.item(), g_loss_p.item(), g_loss_r.item())
-
             if global_step >= args.discr_train_start_step:
                 d_optimizer.zero_grad()
 
-                C_ij = discriminator(hazy_samples, samples)
+                samples_noise = samples + torch.randn_like(samples) * 0.1
+
+                C_ij = discriminator(hazy_samples, samples_noise)
                 C_ik = discriminator(hazy_samples, g_outputs.detach())
 
                 d_loss = ralsgan_loss(C_ij, C_ik)
@@ -155,6 +147,35 @@ def train(args):
                 d_step_lr.step()
 
                 out_str += ', d_loss {:.4f}'.format(d_loss.item())
+
+            if global_step >= args.gen_train_start_step:
+                g_optimizer.zero_grad()
+
+                g_loss_c = content_loss(samples, g_outputs)
+
+                samples_norm = vgg_preprocess(samples)
+                g_outputs_norm = vgg_preprocess(g_outputs)
+
+                g_loss_p = perceptual_loss(vgg19(samples_norm), vgg19(g_outputs_norm))
+
+                g_loss = args.lambda_c * g_loss_c + args.lambda_p * g_loss_p
+
+                if global_step >= args.discr_train_start_step:
+                    C_ij = discriminator(hazy_samples, g_outputs)
+                    C_ik = discriminator(hazy_samples, samples)
+
+                    g_loss_r = ralsgan_loss(C_ij, C_ik)
+                    g_loss += args.lambda_r * g_loss_r
+
+                g_loss.backward()
+                g_optimizer.step()
+                g_step_lr.step()
+
+                out_str += ', g_loss {:.4f}, content_loss {:.4f}, perceptual_loss {:.4f}'.format(
+                    g_loss.item(), g_loss_c.item(), g_loss_p.item())
+
+                if global_step >= args.discr_train_start_step:
+                    out_str += ', ralsgan_loss {:.4f}'.format(g_loss_r.item())
 
             print(out_str + ', time: {:.2f} s'.format(time.time() - start))
 
@@ -172,7 +193,9 @@ def train(args):
                     writer.add_scalar('generator/generator_loss', g_loss, global_step)
                     writer.add_scalar('generator/content_loss', g_loss_c, global_step)
                     writer.add_scalar('generator/perceptual_loss', g_loss_p, global_step)
-                    writer.add_scalar('generator/ralsgan_loss', g_loss_r, global_step)
+
+                    if global_step >= args.discr_train_start_step:
+                        writer.add_scalar('generator/ralsgan_loss', g_loss_r, global_step)
 
                     if global_step > args.discr_train_start_step:
                         writer.add_scalar('discriminator/discriminator_loss', d_loss, global_step)
@@ -189,9 +212,9 @@ def train(args):
                     depth.squeeze_(0)
                     test_g_out.squeeze_(0)
 
-                    inv_normalize(img)
-                    inv_normalize(hazed_img)
-                    inv_normalize(test_g_out)
+                    img = inv_normalize(img)
+                    hazed_img = inv_normalize(hazed_img)
+                    test_g_out = inv_normalize(test_g_out)
 
                     writer.add_image('GT', img, global_step)
                     writer.add_image('Depth_map', depth, global_step)
@@ -219,7 +242,7 @@ if __name__ == '__main__':
     parser.add_argument('--use_cudnn_benchmark', action='store_true', help='Use CuDNN benchmark')
     parser.add_argument('-bs', '--batch_size', type=int, default=1, help='batch size')
     parser.add_argument('--num_workers', type=int, default=cpu_count(), help='Number of workers')
-    parser.add_argument('--epochs', type=int, default=100, help='Number of epochs')
+    parser.add_argument('--epochs', type=int, default=80000, help='Number of epochs')
     parser.add_argument('--logdir', type=str, default='logdir', help='Directory to save checkpoints and '
                                                                      'tensorboard output')
     parser.add_argument('--gen_train_start_step', type=int, default=0, help='Step to start training generator')
@@ -235,5 +258,9 @@ if __name__ == '__main__':
     parser.add_argument('--lr_decay_step', type=int, default=100000, help='Decrease LR every nth step')
     parser.add_argument('--use_log_softmax', type=bool, default=True, help='Use log_softmax activation in '
                                                                            'attention models instead of softmax')
+    parser.add_argument('--interpolation_mode', type=int, default=0, help='lerp=0, slerp=1, Conv2D=2')
+    parser.add_argument('--color_jitter', type=bool, default=False, help='Use color jittering for data augmentation')
+    parser.add_argument('--tau_start_step', type=int, default=0, help='Train interpolation parameter '
+                                                                      'after specified step')
     args = parser.parse_args()
     train(args)

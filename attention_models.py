@@ -4,6 +4,8 @@ from torch.nn.functional import relu, softmax, log_softmax
 from modules import Conv2d
 import torch
 
+from utils import slerp
+
 
 class ReshapeSoftmax(Module):
     def __init__(self, use_log=True):
@@ -12,9 +14,9 @@ class ReshapeSoftmax(Module):
 
     def forward(self, x):
         if self.use_log:
-            return log_softmax(x.view(x.size(0), x.size(1), -1), dim=2).view_as(x)
+            return log_softmax(x.flatten(start_dim=2), dim=2).view_as(x)
         else:
-            return softmax(x.view(x.size(0), x.size(1), -1), dim=2).view_as(x)
+            return softmax(x.flatten(start_dim=2), dim=2).view_as(x)
 
 
 class DCAM(Module):
@@ -50,17 +52,28 @@ class DCAM(Module):
 
 
 class InterpolationLayer(Module):
-    def __init__(self):
+    def __init__(self, interpolation_mode, out_channels):
         super(InterpolationLayer, self).__init__()
-        self.tau = Parameter(torch.zeros(1))
+        self.tau = Parameter(torch.tensor([0.5]))
+        self.interpolation_mode = interpolation_mode
+        self.layer = Conv2d(out_channels * 2, out_channels, 1, stride=1, padding=0)
 
     def forward(self, alpha, beta):
-        tau = self.tau.clamp(0, 1)
-        return tau * alpha + (1 - tau) * beta
+        if self.interpolation_mode == 0:
+            tau = self.tau.clamp(0, 1)
+            return tau * alpha + (1 - tau) * beta
+        elif self.interpolation_mode == 1:
+            tau = self.tau.clamp(0, 1)
+            return slerp(tau, beta.flatten(start_dim=1), alpha.flatten(start_dim=1)).view_as(alpha)
+        elif self.interpolation_mode == 2:
+            merged = torch.cat([alpha, beta], 1)
+            return relu(self.layer(merged))
+        else:
+            assert 'Unsupported interpolation mode'
 
 
 class MCAM(Module):
-    def __init__(self, in_channels, use_log_softmax):
+    def __init__(self, in_channels, use_log_softmax, interpolation_mode):
         super(MCAM, self).__init__()
 
         out_channels = in_channels // 4
@@ -72,7 +85,7 @@ class MCAM(Module):
         self.conv4 = Conv2d(out_channels * 4, in_channels, kernel_size=1, stride=1, padding=0)
 
         self.softmax = ReshapeSoftmax(use_log_softmax)
-        self.interpolation = InterpolationLayer()
+        self.interpolation = InterpolationLayer(interpolation_mode, out_channels=in_channels)
 
         self.feat_conv = Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
 

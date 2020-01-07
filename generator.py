@@ -7,31 +7,31 @@ from attention_models import DCAM, MCAM
 
 
 class Generator(Module):
-    def __init__(self, in_channels, use_log_softmax):
+    def __init__(self, in_channels, use_log_softmax, interpolation_mode):
         super(Generator, self).__init__()
         self.use_log_softmax = use_log_softmax
 
         # Encoder
         self.en_conv = Conv2d(in_channels, 32, kernel_size=3, stride=1)
 
-        self.en_block1 = ENBlock(32, True)
+        self.en_block1 = ENBlock(32, True, use_log_softmax=use_log_softmax)
 
-        self.en_block2 = ENBlock(64)
-        self.en_block3 = ENBlock(128)
-        self.en_block4 = ENBlock(256)
-        self.en_block5 = ENBlock(512)
+        self.en_block2 = ENBlock(64, use_log_softmax=use_log_softmax)
+        self.en_block3 = ENBlock(128, use_log_softmax=use_log_softmax)
+        self.en_block4 = ENBlock(256, use_log_softmax=use_log_softmax)
+        self.en_block5 = ENBlock(512, use_log_softmax=use_log_softmax)
 
         self.res_block1 = ResBlock(1024)
 
         # Decoder
         self.res_block2 = ResBlock(1024)
 
-        self.de_block1 = DEBlock(1024)
-        self.de_block2 = DEBlock(512)
-        self.de_block3 = DEBlock(256)
-        self.de_block4 = DEBlock(128)
+        self.de_block1 = DEBlock(1024, use_log_softmax=use_log_softmax, interpolation_mode=interpolation_mode)
+        self.de_block2 = DEBlock(512, use_log_softmax=use_log_softmax, interpolation_mode=interpolation_mode)
+        self.de_block3 = DEBlock(256, use_log_softmax=use_log_softmax, interpolation_mode=interpolation_mode)
+        self.de_block4 = DEBlock(128, use_log_softmax=use_log_softmax, interpolation_mode=interpolation_mode)
 
-        self.de_block5 = DEBlock(64, True)
+        self.de_block5 = DEBlock(64, True, use_log_softmax=use_log_softmax, interpolation_mode=interpolation_mode)
 
         self.de_conv = Conv2d(32, 3, kernel_size=3, stride=1)
 
@@ -70,12 +70,16 @@ class Generator(Module):
     def feat_map_layers(self):
         return [self.en_block1.dcam.softmax, self.de_block5.mcam.softmax, self.de_block5.mcam.interpolation]
 
+    @torch.jit.ignore
+    def interpolation_layer(self):
+        return self.de_block5.mcam.interpolation
+
 
 class ResBlock(Module):
     def __init__(self, in_channels):
         super(ResBlock, self).__init__()
 
-        self.layer =  Sequential(
+        self.layer = Sequential(
             Conv2d(in_channels, in_channels, kernel_size=3, stride=1),
             ReLU(inplace=True),
             Conv2d(in_channels, in_channels, kernel_size=3, stride=1)
@@ -111,12 +115,12 @@ class ENBlock(Module):
 
 
 class DEBlock(Module):
-    def __init__(self, in_channels, with_mcam=False, use_log_softmax=True):
+    def __init__(self, in_channels, with_mcam=False, use_log_softmax=True, interpolation_mode=0):
         super(DEBlock, self).__init__()
         out_channels = in_channels // 2
 
         if with_mcam:
-            self.mcam = MCAM(out_channels, use_log_softmax)
+            self.mcam = MCAM(out_channels, use_log_softmax, interpolation_mode=interpolation_mode)
         else:
             self.mcam = None
 

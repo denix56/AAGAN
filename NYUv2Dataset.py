@@ -1,5 +1,5 @@
 from torch.utils.data import Dataset
-from torchvision.transforms import RandomResizedCrop, Normalize
+from torchvision.transforms import RandomResizedCrop, Normalize, ColorJitter
 from torchvision.transforms.functional import resized_crop, to_pil_image, hflip, to_tensor
 from scipy.io import loadmat
 import h5py
@@ -15,8 +15,9 @@ class NYUv2Dataset(Dataset):
         super(NYUv2Dataset, self).__init__()
         self.is_training = is_training
         self.crop_size = crop_size
-        self.normalize = Normalize(mean=[0.485, 0.456, 0.406],
-                                   std=[0.229, 0.224, 0.225], inplace=True)
+        self.color_jittering = args.color_jitter
+        self.normalize = Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True)
+        self.jitter = ColorJitter(0.4, 0.4, 0.4, 0.4)
 
         with h5py.File(args.dataset_path, 'r') as data:
             splits = loadmat(args.splits_path)
@@ -52,10 +53,17 @@ class NYUv2Dataset(Dataset):
                 image = hflip(image)
                 depth = hflip(depth)
 
+            if self.color_jittering:
+                image = self.jitter(image)
+
         image = to_tensor(image)
         depth = to_tensor(depth)
 
         hazy_image = haze_images(image, depth)
+
+        #if self.is_training:
+        #    hazy_image += 0.01 * torch.randn_like(hazy_image)
+        #    hazy_image.clamp_(0, 1)
 
         self.normalize(image)
         self.normalize(hazy_image)
