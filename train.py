@@ -4,6 +4,8 @@ import os
 import argparse
 import random
 
+from skimage import measure
+
 import torch
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -14,10 +16,31 @@ import torchvision.models as models
 from torchvision.utils import make_grid
 from torchvision.transforms import Normalize
 
+import matplotlib.pyplot as plt
+
+import numpy as np
+
 from generator import Generator
-from discriminator import Discriminator
+from discriminator import Discriminator, NLayerDiscriminator
 from loss import *
 from NYUv2Dataset import NYUv2Dataset
+
+
+def add_graph_gan(generator, loader, device, writer):
+    class VisModel(torch.nn.Module):
+        def __init__(self, generator, discriminator):
+            super(VisModel, self).__init__()
+            self.g = generator
+            self.d = discriminator
+
+        def forward(self, hazy):
+            return self.d(hazy, self.g(hazy))
+
+    _, hazy, _ = next(iter(loader))
+    hazy = hazy.to(device)
+
+    #model_seq = VisModel(generator, discriminator)
+    writer.add_graph(generator, hazy)
 
 
 def save_checkpoint(args, generator, discriminator, g_optimizer, d_optimizer, g_step_lr, d_step_lr, step):
@@ -46,6 +69,11 @@ def load_checkpoint(args, generator, discriminator, g_optimizer, d_optimizer, g_
     return ckpt['step']
 
 
+def set_requires_grad(model, requires_grad):
+    for param in model.parameters():
+        param.requires_grad = requires_grad
+
+
 def train(args):
     os.makedirs(args.logdir, exist_ok=True)
 
@@ -54,11 +82,15 @@ def train(args):
 
     torch.backends.cudnn.benchmark = args.use_cudnn_benchmark
 
-    dataset = NYUv2Dataset(args, True)
-    loader = DataLoader(dataset, batch_size=args.batch_size, num_workers=args.num_workers,
+    indices = np.random.permutation(1449)
+    training_idx, test_idx = indices[:1300], indices[1300:]
+
+    train_dataset = NYUv2Dataset(args, training_idx, True)
+
+    loader = DataLoader(train_dataset, batch_size=args.batch_size, num_workers=args.num_workers,
                         shuffle=True, pin_memory=True)
 
-    test_dataset = NYUv2Dataset(args, False)
+    test_dataset = NYUv2Dataset(args, test_idx, False)
     test_loader = DataLoader(test_dataset, batch_size=1, num_workers=0,
                         shuffle=True, pin_memory=True)
 
@@ -91,13 +123,7 @@ def train(args):
 
     writer = SummaryWriter(log_dir=args.logdir)
 
-    img, depth = next(iter(loader))
-    img = img.to(device)
-
-    writer.add_graph(generator, img)
-    #writer.add_graph(discriminator, (img, generator(img)))
-
-    del img, depth
+    add_graph_gan(generator, test_loader, device, writer)
 
     vgg_normalize = Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     inv_normalize = lambda x: torch.clamp((x + 1) * 0.5, 0, 1)
@@ -112,8 +138,15 @@ def train(args):
 
         return hook
 
-    interpolation_layer = generator.interpolation_layer()
-    interpolation_layer.tau.requires_grad = False
+    #interpolation_layer = generator.interpolation_layer()
+    #interpolation_layer.tau.requires_grad = False
+
+    cmap = plt.get_cmap('jet')
+
+    layers = generator.feat_map_layers()
+    map_names = ['prior_feature_map', 'posterior_feature_map', 'novel_feature_map']
+    for name, layer in zip(map_names, layers):
+        layer.register_forward_hook(get_hook('generator/' + name))
 
     for epoch in range(args.epochs):
         print('Epoch {}'.format(epoch))
@@ -124,8 +157,8 @@ def train(args):
             samples = samples.to(device)
             hazy_samples = hazy_samples.to(device)
 
-            if global_step >= args.tau_start_step:
-                interpolation_layer.tau.requires_grad = True
+            # global_step >= args.tau_start_step:
+            #    interpolation_layer.tau.requires_grad = True
 
             g_outputs = generator(hazy_samples)
 
@@ -134,12 +167,16 @@ def train(args):
             out_str = 'Step {}'.format(global_step)
 
             if global_step >= args.discr_train_start_step:
+                set_requires_grad(discriminator, True)
+
                 d_optimizer.zero_grad()
 
-                samples_noise = samples + torch.randn_like(samples) * 0.1
+                samples_noise = samples# + torch.randn_like(samples) * 0.05
+                hazy_samples_noise = hazy_samples# + torch.randn_like(hazy_samples) * 0.05
+                g_outputs_noise = g_outputs.detach()# + torch.randn_like(g_outputs) * 0.05
 
-                C_ij = discriminator(hazy_samples, samples_noise)
-                C_ik = discriminator(hazy_samples, g_outputs.detach())
+                C_ij = discriminator(hazy_samples_noise, samples_noise)
+                C_ik = discriminator(hazy_samples_noise, g_outputs_noise)
 
                 d_loss = ralsgan_loss(C_ij, C_ik)
                 d_loss.backward()
@@ -149,6 +186,7 @@ def train(args):
                 out_str += ', d_loss {:.4f}'.format(d_loss.item())
 
             if global_step >= args.gen_train_start_step:
+                set_requires_grad(discriminator, False)
                 g_optimizer.zero_grad()
 
                 g_loss_c = content_loss(samples, g_outputs)
@@ -186,6 +224,8 @@ def train(args):
             if global_step % args.summary_step == 0:
                 with torch.no_grad():
                     img, hazed_img, depth = next(iter(test_loader))
+                    img_arr = np.moveaxis(np.squeeze(img.numpy()), 0, -1)
+
                     img = img.to(device)
                     hazed_img = hazed_img.to(device)
                     depth = depth.to(device)
@@ -200,12 +240,24 @@ def train(args):
                     if global_step > args.discr_train_start_step:
                         writer.add_scalar('discriminator/discriminator_loss', d_loss, global_step)
 
-                    layers = generator.feat_map_layers()
-                    map_names = ['prior_feature_map', 'posterior_feature_map', 'novel_feature_map']
-                    for name, layer in zip(map_names, layers):
-                        layer.register_forward_hook(get_hook(name))
-
                     test_g_out = generator(hazed_img)
+                    test_g_arr = np.moveaxis(np.squeeze(test_g_out.cpu().numpy()), 0, -1)
+
+                    print(img_arr.shape, test_g_arr.shape)
+
+                    psnr = measure.compare_psnr(img_arr, test_g_arr)
+                    ssim = measure.compare_ssim(img_arr, test_g_arr, multichannel=True)
+
+                    writer.add_scalar('generator/psnr', psnr, global_step)
+                    writer.add_scalar('generator/ssim', ssim, global_step)
+
+                    test_d_out = torch.sigmoid(discriminator(hazed_img, img).detach())
+                    test_d_out = test_d_out.view(-1, 1, test_d_out.size(2), test_d_out.size(3))
+                    feat_maps['discriminator/real'] = test_d_out
+
+                    test_d_out = torch.sigmoid(discriminator(hazed_img, test_g_out).detach())
+                    test_d_out = test_d_out.view(-1, 1, test_d_out.size(2), test_d_out.size(3))
+                    feat_maps['discriminator/fake'] = test_d_out
 
                     img.squeeze_(0)
                     hazed_img.squeeze_(0)
@@ -222,7 +274,24 @@ def train(args):
                     writer.add_image('Dehazed', test_g_out, global_step)
 
                     for name, feat_map in feat_maps.items():
-                        writer.add_image(name, make_grid(feat_map, normalize=True, scale_each=True), global_step)
+                        tensor = feat_map.clone()
+
+                        def norm_ip(img, min, max):
+                            img.clamp_(min=min, max=max)
+                            img.add_(-min).div_(max - min + 1e-5)
+
+                        def norm_range(t):
+                            norm_ip(t, float(t.min()), float(t.max()))
+
+                        for t in tensor:  # loop over mini-batch dimension
+                            norm_range(t)
+
+                        images = tensor.cpu().numpy()
+
+                        images = cmap(images)
+                        images = np.delete(images, 3, axis=-1)
+                        images = np.squeeze(images, axis=1)
+                        writer.add_images(name, images, global_step, dataformats='NHWC')
 
                     for name, value in generator.named_parameters():
                         writer.add_histogram('generator/' + name.replace('.', '/'), value, global_step)
@@ -255,12 +324,12 @@ if __name__ == '__main__':
     parser.add_argument('--lambda_c', type=float, default=100, help='Content loss coef')
     parser.add_argument('--lambda_p', type=float, default=100, help='Perceptual loss coef')
     parser.add_argument('--lambda_r', type=float, default=0.1, help='RaLSGAN loss coef')
-    parser.add_argument('--lr_decay_step', type=int, default=100000, help='Decrease LR every nth step')
+    parser.add_argument('--lr_decay_step', type=int, default=55000, help='Decrease LR every nth step')
     parser.add_argument('--use_log_softmax', type=bool, default=True, help='Use log_softmax activation in '
                                                                            'attention models instead of softmax')
     parser.add_argument('--interpolation_mode', type=int, default=0, help='lerp=0, slerp=1, Conv2D=2')
     parser.add_argument('--color_jitter', type=bool, default=False, help='Use color jittering for data augmentation')
-    parser.add_argument('--tau_start_step', type=int, default=0, help='Train interpolation parameter '
-                                                                      'after specified step')
+    #parser.add_argument('--tau_start_step', type=int, default=0, help='Train interpolation parameter '
+    #                                                                  'after specified step')
     args = parser.parse_args()
     train(args)

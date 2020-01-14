@@ -9,7 +9,7 @@ def haze_images(img, depth, beta_min=0.6, beta_max=1.8, eta_min=0.5, eta_max=1):
     depths_min = depths_min.view(1, 1, 1)
     depths_max = depths_max.view(1, 1, 1)
 
-    depth = (depth - depths_min) / (np.maximum(1e-10, depths_max - depths_min))
+    depth = (depth - depths_min) / (depths_max - depths_min + 1e-8)
 
     beta = torch.rand(1, 1, 1) * (beta_max - beta_min) + beta_min
     t = torch.exp(-beta * depth)
